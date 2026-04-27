@@ -282,6 +282,222 @@ hermes gateway status
 journalctl -u hermes-gateway.service -n 120 --no-pager
 ```
 
+## 日常 Git 更新与服务器发布流程
+
+本项目现在建议保持两个远程仓库：
+
+| 名称 | 含义 | 地址 |
+|---|---|---|
+| `upstream` | 官方 Hermes Agent 仓库，只用于同步官方更新 | `https://github.com/NousResearch/hermes-agent.git` |
+| `origin` | 你自己的 fork 仓库，用于保存你的修改 | `https://github.com/zhl-2022/hermes-agent.git` |
+
+当前开发分支：
+
+```text
+zhl/foxcode-feishu-models
+```
+
+核心原则：
+
+1. 本地 Windows 负责改代码、提交、同步官方、推送到你的 fork。
+2. 服务器只负责拉取你 fork 上的分支并重启 gateway。
+3. 服务器尽量不要直接改代码；服务器配置文件 `/root/.hermes/config.yaml` 可以单独维护。
+
+### 每天先检查官方有没有更新
+
+在本地 Windows 执行：
+
+```powershell
+cd E:\company_klb\hermes-agent
+git fetch upstream main
+git status --short --branch
+git log --oneline HEAD..upstream/main
+```
+
+命令含义：
+
+| 命令 | 作用 |
+|---|---|
+| `git fetch upstream main` | 只下载官方 `main` 的最新提交，不修改你当前代码 |
+| `git status --short --branch` | 查看当前分支和工作区是否干净 |
+| `git log --oneline HEAD..upstream/main` | 查看官方比你当前分支多了哪些提交 |
+
+判断结果：
+
+| 现象 | 说明 | 下一步 |
+|---|---|---|
+| `git log HEAD..upstream/main` 没有输出 | 官方没有新提交 | 不需要 rebase |
+| 有若干提交输出 | 官方更新了 | 执行 `git rebase upstream/main` |
+| `git status` 显示 `M`、`A`、`??` | 你本地有未提交改动 | 先提交或 stash，再 rebase |
+
+### 情况一：你本地没有改代码，只同步官方更新
+
+适用场景：你今天只是想把官方新版本同步进你的 foxcode 分支。
+
+```powershell
+cd E:\company_klb\hermes-agent
+git fetch upstream main
+git rebase upstream/main
+python -m py_compile agent/anthropic_adapter.py gateway/run.py hermes_cli/commands.py hermes_cli/model_switch.py
+git push --force-with-lease origin zhl/foxcode-feishu-models
+```
+
+命令含义：
+
+| 命令 | 作用 |
+|---|---|
+| `git rebase upstream/main` | 把你的 foxcode 修改重新放到官方最新版后面 |
+| `py_compile` | 做最小语法检查，避免推送明显语法错误 |
+| `git push --force-with-lease` | rebase 会改写提交历史，所以需要用安全的强制推送更新 fork |
+
+`--force-with-lease` 比 `--force` 安全：如果远端分支被别人更新过，它会拒绝覆盖。
+
+### 情况二：你本地改了代码
+
+适用场景：你让 Codex 或自己修改了源码、文档、测试。
+
+先提交你的修改：
+
+```powershell
+cd E:\company_klb\hermes-agent
+git status --short
+git add 你修改的文件
+git commit -m "简短说明这次修改"
+```
+
+再同步官方最新版：
+
+```powershell
+git fetch upstream main
+git rebase upstream/main
+```
+
+如果没有冲突，继续：
+
+```powershell
+python -m py_compile agent/anthropic_adapter.py gateway/run.py hermes_cli/commands.py hermes_cli/model_switch.py
+git push --force-with-lease origin zhl/foxcode-feishu-models
+```
+
+如果出现冲突，不要乱删文件，也不要执行 `git reset --hard`。把终端里的冲突信息发给 Codex，例如：
+
+```text
+CONFLICT (content): Merge conflict in gateway/run.py
+CONFLICT (content): Merge conflict in hermes_cli/model_switch.py
+error: could not apply ...
+```
+
+### 情况三：本地已经 push 成功，服务器更新代码
+
+在服务器执行：
+
+```bash
+ssh srv4
+cd /root/zhl/hermes-agent
+source venv/bin/activate
+
+git fetch origin zhl/foxcode-feishu-models
+git checkout zhl/foxcode-feishu-models
+git pull --ff-only origin zhl/foxcode-feishu-models
+
+python -m py_compile \
+  agent/anthropic_adapter.py \
+  gateway/run.py \
+  hermes_cli/commands.py \
+  hermes_cli/model_switch.py
+
+systemctl restart hermes-gateway.service
+systemctl status hermes-gateway.service --no-pager -l
+journalctl -u hermes-gateway.service -n 100 --no-pager
+```
+
+命令含义：
+
+| 命令 | 作用 |
+|---|---|
+| `git fetch origin ...` | 从你的 fork 下载最新分支 |
+| `git checkout ...` | 确保服务器在 foxcode 分支 |
+| `git pull --ff-only ...` | 只允许快进更新，避免服务器产生额外 merge commit |
+| `systemctl restart ...` | 重启 Feishu gateway，让新代码生效 |
+| `journalctl ...` | 查看 gateway 最近日志 |
+
+飞书里验证：
+
+```text
+/models
+/model claude-opus-4-6 --provider foxcode-claude
+/model gpt-5.5 --provider foxcode-codex
+```
+
+### Git 冲突是什么
+
+冲突不是代码坏了，而是 Git 不知道应该保留哪一边的修改。
+
+例如官方也改了 `gateway/run.py`，你也改了 `gateway/run.py`，而且两边改到了相邻位置，Git 就会在文件里插入类似内容：
+
+- 第一段从 `<<<<<<< HEAD` 开始，表示官方 `main` 里的内容。
+- 中间用 `=======` 分隔。
+- 第二段到 `>>>>>>> 5085b209` 结束，表示你的分支里的内容。
+
+含义：
+
+| 标记 | 含义 |
+|---|---|
+| `<<<<<<< HEAD` 到 `=======` | 当前基底，也就是官方 `upstream/main` 的内容 |
+| `=======` 到 `>>>>>>> ...` | 你自己的提交内容 |
+| `>>>>>>> 5085b209` | 正在 rebase 的那个本地提交 |
+
+解决冲突不是简单选上面或下面，而是看两边代码的意图，然后合成最终正确版本。
+
+这次 foxcode 分支的冲突处理原则是：
+
+| 文件 | 处理方式 |
+|---|---|
+| `agent/anthropic_adapter.py` | 保留官方新增的 Azure Anthropic 逻辑，同时保留 foxcode Claude Code headers 逻辑 |
+| `hermes_cli/model_switch.py` | 保留官方新增的 `api_mode` 校验参数，同时保留“配置文件里声明的 foxcode 模型可直接切换”的逻辑 |
+| `hermes_cli/commands.py` | 保留官方把 `/provider` 作为 `/model` 别名的设计，同时新增 gateway-only `/models` |
+| `gateway/run.py` | 增加 `/models` 命令处理，不恢复旧的独立 `/provider` handler |
+
+Codex 解决冲突后的标准动作：
+
+```powershell
+rg -n "^(<<<<<<<|=======|>>>>>>>)" agent/anthropic_adapter.py gateway/run.py hermes_cli/commands.py hermes_cli/model_switch.py
+python -m py_compile agent/anthropic_adapter.py gateway/run.py hermes_cli/commands.py hermes_cli/model_switch.py
+git add agent/anthropic_adapter.py gateway/run.py hermes_cli/commands.py hermes_cli/model_switch.py
+git -c core.editor=true rebase --continue
+```
+
+其中：
+
+| 命令 | 作用 |
+|---|---|
+| `rg "^(<<<<<<<\|=======\|>>>>>>>)"` | 检查是否还有真正的冲突标记 |
+| `py_compile` | 检查 Python 语法 |
+| `git add` | 告诉 Git 冲突已经解决 |
+| `git rebase --continue` | 继续应用后续提交 |
+
+注意：看到普通注释里的 `====` 不代表冲突，只有行首的 `<<<<<<<`、`=======`、`>>>>>>>` 才是冲突标记。
+
+### 不推荐执行的命令
+
+除非明确知道后果，否则不要执行：
+
+```powershell
+git reset --hard
+git rebase --skip
+git rebase --abort
+git push --force
+```
+
+说明：
+
+| 命令 | 风险 |
+|---|---|
+| `git reset --hard` | 会丢弃未提交修改 |
+| `git rebase --skip` | 会跳过你的某个提交，可能把 foxcode 功能跳没 |
+| `git rebase --abort` | 会取消本次 rebase，回到 rebase 前状态 |
+| `git push --force` | 可能覆盖远端别人新增的提交 |
+
 ## 源码学习路线
 
 ### 第一阶段：建立产品地图
