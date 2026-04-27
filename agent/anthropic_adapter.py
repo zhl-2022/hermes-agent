@@ -347,7 +347,19 @@ def _requires_bearer_auth(base_url: str | None) -> bool:
     if not normalized:
         return False
     normalized = normalized.rstrip("/").lower()
-    return normalized.startswith(("https://api.minimax.io/anthropic", "https://api.minimaxi.com/anthropic"))
+    return normalized.startswith((
+        "https://api.minimax.io/anthropic",
+        "https://api.minimaxi.com/anthropic",
+        "https://code.newcli.com/claude",
+    ))
+
+
+def _requires_claude_code_identity(base_url: str | None) -> bool:
+    """Return True for proxies that expect Claude Code client identity headers."""
+    normalized = _normalize_base_url_text(base_url)
+    if not normalized:
+        return False
+    return normalized.rstrip("/").lower().startswith("https://code.newcli.com/claude")
 
 
 def _common_betas_for_base_url(base_url: str | None) -> list[str]:
@@ -358,9 +370,20 @@ def _common_betas_for_base_url(base_url: str | None) -> list[str]:
     tool-use message triggers a connection error.  Strip that beta for
     Bearer-auth endpoints while keeping all other betas intact.
     """
+    if _requires_claude_code_identity(base_url):
+        return []
     if _requires_bearer_auth(base_url):
         return [b for b in _COMMON_BETAS if b != _TOOL_STREAMING_BETA]
     return _COMMON_BETAS
+
+
+def _apply_claude_code_proxy_headers(request) -> None:
+    """Remove Anthropic SDK fingerprint headers for Claude Code-compatible proxies."""
+    for key in list(request.headers.keys()):
+        if key.lower().startswith("x-stainless"):
+            del request.headers[key]
+    request.headers["user-agent"] = f"claude-cli/{_get_claude_code_version()} (external, cli)"
+    request.headers["x-app"] = "cli"
 
 
 def build_anthropic_client(api_key: str, base_url: str = None, timeout: float = None):
@@ -382,7 +405,7 @@ def build_anthropic_client(api_key: str, base_url: str = None, timeout: float = 
 
     normalize_proxy_env_vars()
 
-    from httpx import Timeout
+    from httpx import Client, Timeout
 
     normalized_base_url = _normalize_base_url_text(base_url)
     _read_timeout = timeout if (isinstance(timeout, (int, float)) and timeout > 0) else 900.0
@@ -400,6 +423,12 @@ def build_anthropic_client(api_key: str, base_url: str = None, timeout: float = 
             kwargs["default_query"] = {"api-version": "2025-04-15"}
         else:
             kwargs["base_url"] = normalized_base_url
+    if _requires_claude_code_identity(normalized_base_url):
+        kwargs["http_client"] = Client(
+            timeout=Timeout(timeout=float(_read_timeout), connect=10.0),
+            event_hooks={"request": [_apply_claude_code_proxy_headers]},
+        )
+        kwargs.pop("timeout", None)
     common_betas = _common_betas_for_base_url(normalized_base_url)
 
     if _is_kimi_coding_endpoint(base_url):
@@ -419,8 +448,16 @@ def build_anthropic_client(api_key: str, base_url: str = None, timeout: float = 
         # not use Anthropic's sk-ant-api prefix and would otherwise be misread as
         # Anthropic OAuth/setup tokens.
         kwargs["auth_token"] = api_key
+        default_headers = {}
         if common_betas:
-            kwargs["default_headers"] = {"anthropic-beta": ",".join(common_betas)}
+            default_headers["anthropic-beta"] = ",".join(common_betas)
+        if _requires_claude_code_identity(normalized_base_url):
+            default_headers.update({
+                "user-agent": f"claude-cli/{_get_claude_code_version()} (external, cli)",
+                "x-app": "cli",
+            })
+        if default_headers:
+            kwargs["default_headers"] = default_headers
     elif _is_third_party_anthropic_endpoint(base_url):
         # Third-party proxies (Azure AI Foundry, AWS Bedrock, etc.) use their
         # own API keys with x-api-key auth. Skip OAuth detection — their keys

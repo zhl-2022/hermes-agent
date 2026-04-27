@@ -3961,6 +3961,9 @@ class GatewayRunner:
         if canonical == "model":
             return await self._handle_model_command(event)
 
+        if canonical == "models":
+            return await self._handle_models_command(event)
+
         if canonical == "personality":
             return await self._handle_personality_command(event)
 
@@ -6125,6 +6128,80 @@ class GatewayRunner:
         else:
             lines.append("_(session only -- add `--global` to persist)_")
 
+        return "\n".join(lines)
+
+    async def _handle_models_command(self, event: MessageEvent) -> str:
+        """List models explicitly configured in config.yaml."""
+        try:
+            from hermes_cli.config import load_config
+        except Exception as exc:
+            return f"Error loading config: {exc}"
+
+        cfg = load_config()
+        model_cfg = cfg.get("model", {}) if isinstance(cfg.get("model"), dict) else {}
+        current_model = model_cfg.get("default") or model_cfg.get("model") or "unknown"
+        current_provider = model_cfg.get("provider") or "unknown"
+
+        lines = [
+            f"Current: `{current_model}` on `{current_provider}`",
+            "",
+            "Configured models:",
+        ]
+
+        providers = cfg.get("providers") or {}
+        if isinstance(providers, dict):
+            for name, entry in providers.items():
+                if not isinstance(entry, dict):
+                    continue
+                models = entry.get("models") or {}
+                if not models:
+                    model = entry.get("model")
+                    models = {model: {}} if model else {}
+                if not models:
+                    continue
+                lines.append(f"**{entry.get('name') or name}** `--provider {name}`")
+                for mid, meta in models.items():
+                    ctx = meta.get("context_length") if isinstance(meta, dict) else None
+                    out = meta.get("max_tokens") if isinstance(meta, dict) else None
+                    suffix = []
+                    if ctx:
+                        suffix.append(f"{int(ctx):,} ctx")
+                    if out:
+                        suffix.append(f"{int(out):,} out")
+                    detail = f" ({', '.join(suffix)})" if suffix else ""
+                    lines.append(f"  - `{mid}`{detail}")
+
+        custom = cfg.get("custom_providers") or []
+        if isinstance(custom, list):
+            for entry in custom:
+                if not isinstance(entry, dict):
+                    continue
+                name = entry.get("name") or "custom"
+                slug = "custom:" + str(name).strip().lower().replace(" ", "-")
+                models = entry.get("models") or {}
+                if not models:
+                    model = entry.get("model")
+                    models = {model: {}} if model else {}
+                if not models:
+                    continue
+                lines.append(f"**{name}** `--provider {name}`")
+                for mid, meta in models.items():
+                    ctx = meta.get("context_length") if isinstance(meta, dict) else None
+                    out = meta.get("max_tokens") if isinstance(meta, dict) else None
+                    suffix = []
+                    if ctx:
+                        suffix.append(f"{int(ctx):,} ctx")
+                    if out:
+                        suffix.append(f"{int(out):,} out")
+                    detail = f" ({', '.join(suffix)})" if suffix else ""
+                    lines.append(f"  - `{mid}`{detail}")
+
+        lines.extend([
+            "",
+            "Switch examples:",
+            "`/model gpt-5.5 --provider foxcode-codex`",
+            "`/model claude-sonnet-4-6 --provider foxcode-claude`",
+        ])
         return "\n".join(lines)
 
     async def _handle_personality_command(self, event: MessageEvent) -> str:

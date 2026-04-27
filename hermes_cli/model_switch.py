@@ -91,6 +91,58 @@ def _check_hermes_model_warning(model_name: str) -> str:
     return ""
 
 
+def _configured_provider_model_exists(
+    provider: str,
+    model_name: str,
+    *,
+    user_providers: dict | None = None,
+    custom_providers: list | None = None,
+) -> bool:
+    """Return True when config.yaml explicitly declares this provider/model.
+
+    Custom provider endpoints do not always expose a compatible `/models`
+    endpoint. If the user has pinned a model under config.yaml `models:`, trust
+    that declaration so `/model ... --provider <custom>` can switch to it.
+    """
+    provider_norm = (provider or "").strip().lower()
+    model_norm = (model_name or "").strip().lower()
+    if not provider_norm or not model_norm:
+        return False
+
+    def _models_include(models) -> bool:
+        if isinstance(models, dict):
+            return model_norm in {str(k).strip().lower() for k in models}
+        if isinstance(models, list):
+            for item in models:
+                if isinstance(item, str) and item.strip().lower() == model_norm:
+                    return True
+                if isinstance(item, dict):
+                    mid = item.get("id") or item.get("model") or item.get("name")
+                    if isinstance(mid, str) and mid.strip().lower() == model_norm:
+                        return True
+        return False
+
+    if isinstance(user_providers, dict):
+        entry = user_providers.get(provider_norm)
+        if isinstance(entry, dict) and _models_include(entry.get("models")):
+            return True
+
+    if isinstance(custom_providers, list):
+        requested = provider_norm.removeprefix("custom:")
+        for entry in custom_providers:
+            if not isinstance(entry, dict):
+                continue
+            name = str(entry.get("name") or "").strip().lower().replace(" ", "-")
+            provider_key = str(entry.get("provider_key") or "").strip().lower().replace(" ", "-")
+            if provider_norm not in {name, provider_key, f"custom:{name}", f"custom:{provider_key}"}:
+                if requested not in {name, provider_key}:
+                    continue
+            if _models_include(entry.get("models")):
+                return True
+
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Model aliases -- short names -> (vendor, family) with NO version numbers.
 # Resolved dynamically against the live models.dev catalog.
@@ -863,47 +915,45 @@ def switch_model(
     new_model = normalize_model_for_provider(new_model, target_provider)
 
     # --- Validate ---
-    try:
-        validation = validate_requested_model(
-            new_model,
-            target_provider,
-            api_key=api_key,
-            base_url=base_url,
-            api_mode=api_mode or None,
-        )
-    except Exception as e:
+    if _configured_provider_model_exists(
+        target_provider,
+        new_model,
+        user_providers=user_providers,
+        custom_providers=custom_providers,
+    ):
         validation = {
-            "accepted": False,
-            "persist": False,
-            "recognized": False,
-            "message": f"Could not validate `{new_model}`: {e}",
+            "accepted": True,
+            "persist": True,
+            "recognized": True,
+            "message": None,
         }
-
-    # Override rejection if model is in the user's saved provider config.
-    # API /v1/models may not list cloud/aliased models even though the server supports them.
-    if not validation.get("accepted"):
-        override = False
-        if user_providers:
-            for up in user_providers:
-                if isinstance(up, dict) and up.get("provider") == target_provider:
-                    cfg_models = up.get("models", [])
-                    if new_model in cfg_models or any(
-                        m.get("name") == new_model for m in cfg_models if isinstance(m, dict)
-                    ):
-                        override = True
-                        break
-        if override:
-            validation = {"accepted": True, "persist": True, "recognized": False, "message": validation.get("message", "")}
-        else:
-            msg = validation.get("message", "Invalid model")
-            return ModelSwitchResult(
-                success=False,
-                new_model=new_model,
-                target_provider=target_provider,
-                provider_label=provider_label,
-                is_global=is_global,
-                error_message=msg,
+    else:
+        try:
+            validation = validate_requested_model(
+                new_model,
+                target_provider,
+                api_key=api_key,
+                base_url=base_url,
+                api_mode=api_mode or None,
             )
+        except Exception as e:
+            validation = {
+                "accepted": False,
+                "persist": False,
+                "recognized": False,
+                "message": f"Could not validate `{new_model}`: {e}",
+            }
+
+    if not validation.get("accepted"):
+        msg = validation.get("message", "Invalid model")
+        return ModelSwitchResult(
+            success=False,
+            new_model=new_model,
+            target_provider=target_provider,
+            provider_label=provider_label,
+            is_global=is_global,
+            error_message=msg,
+        )
 
     # Apply auto-correction if validation found a closer match
     if validation.get("corrected_model"):
